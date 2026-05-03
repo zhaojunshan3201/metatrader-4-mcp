@@ -31,11 +31,11 @@ class MT4MCPServer {
     );
 
     // MT4 Windows machine connection - configurable via environment variables
-    this.mt4Host = process.env.MT4_HOST || "192.168.50.161";
+    this.mt4Host = process.env.MT4_HOST || "127.0.0.1";
     this.mt4Port = parseInt(process.env.MT4_PORT || "8080");
     
     // Path for EA reports and status files (configurable via environment)
-    this.reportsPath = process.env.MT4_REPORTS_PATH || "/tmp/mt4_reports";
+    this.reportsPath = process.env.MT4_REPORTS_PATH || path.join(process.cwd(), "mt4_reports");
     
     this.setupToolHandlers();
   }

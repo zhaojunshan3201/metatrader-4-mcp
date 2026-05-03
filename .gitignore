@@ -40,6 +40,9 @@ pids
 # MT4 temporary files
 *.ex4
 *.log
+windows-server/backtests/
+windows-server/compile-temp/
+mt4_reports/
 
 # Claude Code artifacts
 .claude/

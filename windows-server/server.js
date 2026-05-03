@@ -14,42 +14,265 @@ const PORT = process.env.PORT || 8080;
 
 // MT4 data directory - configure this path for your MT4 installation
 const MT4_DATA_PATH =
-  "C:\\Users\\herbe\\AppData\\Roaming\\MetaQuotes\\Terminal"; //process.env.MT4_DATA_PATH || path.join(process.env.APPDATA, 'MetaQuotes', 'Terminal');
+  process.env.MT4_DATA_PATH ||
+  path.join(process.env.APPDATA || "", "MetaQuotes", "Terminal");
 
 // MT4 installation path for MetaEditor
 const MT4_INSTALL_PATH =
   process.env.MT4_INSTALL_PATH ||
-  "C:\\Program Files (x86)\\Pepperstone MetaTrader 4\\metaeditor.exe";
+  path.join(MT4_DATA_PATH, "metaeditor.exe");
 
 // Alternative paths to try for MetaEditor
-const METAEDITOR_PATHS = MT4_INSTALL_PATH; //[process.env.MT4_INSTALL_PATH].filter(Boolean);
+const METAEDITOR_PATHS = [
+  MT4_INSTALL_PATH,
+  "C:\\Program Files (x86)\\MetaTrader 4\\metaeditor.exe",
+  "C:\\Program Files\\MetaTrader 4\\metaeditor.exe",
+].filter(Boolean);
+const MT4_TERMINAL_PATH =
+  process.env.MT4_TERMINAL_PATH ||
+  path.join(MT4_DATA_PATH, "terminal.exe");
+const BACKTEST_WORK_DIR =
+  process.env.MT4_BACKTEST_WORK_DIR || path.join(__dirname, "backtests");
+const BACKTEST_TIMEOUT_MS = Number(process.env.MT4_BACKTEST_TIMEOUT_MS || 180000);
+const REPORTS_DIR =
+  process.env.MT4_REPORTS_PATH ||
+  path.join(MT4_DATA_PATH, "MQL4", "Files", "mt4_reports");
+let lastBacktestStatus = {
+  status: "idle",
+  message: "No bridge-launched backtest has run yet",
+};
 
 app.use(cors());
 app.use(express.json());
 
+async function writeJsonFile(filePath, data) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf-8");
+}
+
+async function updateBacktestStatus(status) {
+  lastBacktestStatus = {
+    ...lastBacktestStatus,
+    ...status,
+    updated_at: new Date().toISOString(),
+  };
+  await writeJsonFile(path.join(REPORTS_DIR, "backtest_status.json"), lastBacktestStatus);
+}
+
+function normalizeDate(dateValue) {
+  return String(dateValue || "").replace(/-/g, ".");
+}
+
+function mapTesterModel(model) {
+  const value = String(model || "Every tick").toLowerCase();
+  if (value.includes("open")) return 2;
+  if (value.includes("control")) return 1;
+  return 0;
+}
+
+function mapTesterPeriod(timeframe) {
+  const value = String(timeframe || "M15").toUpperCase();
+  const allowed = new Set(["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN"]);
+  return allowed.has(value) ? value : "M15";
+}
+
+function sanitizeFilePart(value) {
+  return String(value || "backtest").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_");
+}
+
+async function readTextSmart(filePath) {
+  const buffer = await fs.readFile(filePath);
+  if (buffer.length >= 2 && buffer[0] === 0xff && buffer[1] === 0xfe) {
+    return buffer.toString("utf16le").replace(/^\uFEFF/, "");
+  }
+  const utf8 = buffer.toString("utf8");
+  if (utf8.includes("\u0000")) return buffer.toString("utf16le").replace(/^\uFEFF/, "");
+  if (utf8.includes("\uFFFD")) {
+    try {
+      return new TextDecoder("gb18030").decode(buffer);
+    } catch (error) {
+      return new TextDecoder("gbk").decode(buffer);
+    }
+  }
+  return utf8;
+}
+
+function decodeHtmlEntities(text) {
+  return String(text || "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'");
+}
+
+function parseNumber(value) {
+  const cleaned = String(value || "").replace(/,/g, "").replace(/%/g, "").trim();
+  const match = cleaned.match(/-?\d+(?:\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+function extractMetric(reportText, labels) {
+  for (const label of labels) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`${escaped}(?:\\s*\\([^)]*\\))?\\s+(-?\\d[\\d,.]*(?:\\s*%)?)`, "i");
+    const match = reportText.match(regex);
+    if (match) return parseNumber(match[1]);
+  }
+  return null;
+}
+
+async function parseBacktestReport(reportFile) {
+  const html = await readTextSmart(reportFile);
+  const text = decodeHtmlEntities(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+  ).trim();
+
+  const result = {
+    report_file: reportFile,
+    generated_at: new Date().toISOString(),
+    net_profit: extractMetric(text, ["Total net profit", "Total Net Profit", "总净盈利"]),
+    gross_profit: extractMetric(text, ["Gross profit", "Gross Profit", "总获利"]),
+    gross_loss: extractMetric(text, ["Gross loss", "Gross Loss", "总亏损"]),
+    profit_factor: extractMetric(text, ["Profit factor", "Profit Factor", "盈利比"]),
+    expected_payoff: extractMetric(text, ["Expected payoff", "Expected Payoff", "预期盈利"]),
+    absolute_drawdown: extractMetric(text, ["Absolute drawdown", "Absolute Drawdown", "绝对亏损"]),
+    maximal_drawdown: extractMetric(text, ["Maximal drawdown", "Maximal Drawdown", "最大亏损"]),
+    relative_drawdown_percent: extractMetric(text, ["Relative drawdown", "Relative Drawdown", "相对亏损"]),
+    total_trades: extractMetric(text, ["Total trades", "Total Trades", "交易单总计"]),
+    short_positions: extractMetric(text, ["Short positions", "Short Positions", "卖单"]),
+    long_positions: extractMetric(text, ["Long positions", "Long Positions", "买单"]),
+    modeling_quality: extractMetric(text, ["Modelling quality", "Modeling quality", "复盘模型的质量"]),
+  };
+  return result;
+}
+
+async function writeSetFile(filePath, parameters = {}) {
+  const lines = [];
+  for (const [key, value] of Object.entries(parameters || {})) {
+    lines.push(`${key}=${value}`);
+    lines.push(`${key},F=0`);
+    lines.push(`${key},1=${value}`);
+    lines.push(`${key},2=0`);
+    lines.push(`${key},3=0`);
+  }
+  await fs.writeFile(filePath, lines.join("\r\n") + "\r\n", "utf-8");
+}
+
+async function prepareBacktestExpert(expertName) {
+  const sourceExpertsDir = await findMT4ExpertsDirectory();
+  const backtestRoot = path.dirname(MT4_TERMINAL_PATH);
+  const targetExpertsDir = path.join(backtestRoot, "MQL4", "Experts");
+  await fs.mkdir(targetExpertsDir, { recursive: true });
+
+  for (const ext of [".mq4", ".ex4"]) {
+    const src = path.join(sourceExpertsDir, `${expertName}${ext}`);
+    const dst = path.join(targetExpertsDir, `${expertName}${ext}`);
+    try {
+      await fs.copyFile(src, dst);
+    } catch (error) {
+      // It is valid for an EA to have only source or only compiled output.
+    }
+  }
+}
+
+async function runTerminalBacktest(configPath, reportFile) {
+  await fs.access(MT4_TERMINAL_PATH);
+  return new Promise((resolve) => {
+    const args = ["/portable", configPath];
+    const terminalRoot = path.dirname(MT4_TERMINAL_PATH);
+    const startedAt = Date.now();
+    const terminal = spawn(MT4_TERMINAL_PATH, args, {
+      cwd: terminalRoot,
+      windowsHide: true,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    terminal.stdout?.on("data", (data) => (stdout += data.toString()));
+    terminal.stderr?.on("data", (data) => (stderr += data.toString()));
+
+    const finish = (payload) => {
+      if (done) return;
+      done = true;
+      clearInterval(poll);
+      clearTimeout(timeout);
+      resolve({ stdout, stderr, elapsed_ms: Date.now() - startedAt, ...payload });
+    };
+
+    terminal.on("error", (error) => finish({ success: false, error: error.message }));
+    terminal.on("close", async (code) => {
+      try {
+        await fs.access(reportFile);
+        finish({ success: true, exit_code: code, report_file: reportFile });
+      } catch (error) {
+        finish({ success: false, exit_code: code, error: "Terminal exited before report was created" });
+      }
+    });
+
+    const poll = setInterval(async () => {
+      try {
+        const stats = await fs.stat(reportFile);
+        if (stats.size > 0) finish({ success: true, exit_code: null, report_file: reportFile });
+      } catch (error) {
+        // Keep polling.
+      }
+    }, 2000);
+
+    const timeout = setTimeout(() => {
+      try {
+        terminal.kill();
+      } catch (error) {
+        // Dedicated backtest terminal; safe to stop on timeout.
+      }
+      finish({ success: false, exit_code: null, error: `Backtest timed out after ${BACKTEST_TIMEOUT_MS}ms` });
+    }, BACKTEST_TIMEOUT_MS);
+  });
+}
+
+async function getMT4Mql4Roots() {
+  const directRoot = path.join(MT4_DATA_PATH, "MQL4");
+  try {
+    await fs.access(directRoot);
+    return [directRoot];
+  } catch (err) {
+    // Continue with MetaQuotes terminal-hash layout below.
+  }
+
+  const terminalFolders = await fs.readdir(MT4_DATA_PATH);
+  const roots = [];
+  for (const folder of terminalFolders) {
+    if (folder.length === 32) {
+      const mql4Root = path.join(MT4_DATA_PATH, folder, "MQL4");
+      try {
+        await fs.access(mql4Root);
+        roots.push(mql4Root);
+      } catch (err) {
+        continue;
+      }
+    }
+  }
+  return roots;
+}
+
 // Helper function to read MT4 files
 async function readMT4File(filename) {
   try {
-    // Try multiple possible MT4 terminal folders
-    const terminalFolders = await fs.readdir(MT4_DATA_PATH);
+    const mql4Roots = await getMT4Mql4Roots();
 
-    for (const folder of terminalFolders) {
-      if (folder.length === 32) {
-        // Terminal folder names are 32-character hashes
-        const filePath = path.join(
-          MT4_DATA_PATH,
-          folder,
-          "MQL4",
-          "Files",
-          filename
-        );
-        try {
-          const content = await fs.readFile(filePath, "utf-8");
-          return content.trim();
-        } catch (err) {
-          // File doesn't exist in this terminal folder, try next
-          continue;
-        }
+    for (const mql4Root of mql4Roots) {
+      const filePath = path.join(mql4Root, "Files", filename);
+      try {
+        const content = await fs.readFile(filePath, "utf-8");
+        return content.trim();
+      } catch (err) {
+        continue;
       }
     }
     throw new Error(`File ${filename} not found in any terminal folder`);
@@ -61,21 +284,19 @@ async function readMT4File(filename) {
 // Helper function to write MT4 files
 async function writeMT4File(filename, content) {
   try {
-    const terminalFolders = await fs.readdir(MT4_DATA_PATH);
+    const mql4Roots = await getMT4Mql4Roots();
     let written = false;
 
-    for (const folder of terminalFolders) {
-      if (folder.length === 32) {
-        const filesDir = path.join(MT4_DATA_PATH, folder, "MQL4", "Files");
-        try {
-          await fs.mkdir(filesDir, { recursive: true });
-          const filePath = path.join(filesDir, filename);
-          await fs.writeFile(filePath, content, "utf-8");
-          written = true;
-          break; // Write to first available terminal folder
-        } catch (err) {
-          continue;
-        }
+    for (const mql4Root of mql4Roots) {
+      const filesDir = path.join(mql4Root, "Files");
+      try {
+        await fs.mkdir(filesDir, { recursive: true });
+        const filePath = path.join(filesDir, filename);
+        await fs.writeFile(filePath, content, "utf-8");
+        written = true;
+        break;
+      } catch (err) {
+        continue;
       }
     }
 
@@ -90,18 +311,15 @@ async function writeMT4File(filename, content) {
 // Helper function to find MT4 Experts directory
 async function findMT4ExpertsDirectory() {
   try {
-    const terminalFolders = await fs.readdir(MT4_DATA_PATH);
+    const mql4Roots = await getMT4Mql4Roots();
 
-    for (const folder of terminalFolders) {
-      if (folder.length === 32) {
-        // Terminal folder names are 32-character hashes
-        const expertsPath = path.join(MT4_DATA_PATH, folder, "MQL4", "Experts");
-        try {
-          await fs.access(expertsPath);
-          return expertsPath;
-        } catch (err) {
-          continue;
-        }
+    for (const mql4Root of mql4Roots) {
+      const expertsPath = path.join(mql4Root, "Experts");
+      try {
+        await fs.access(expertsPath);
+        return expertsPath;
+      } catch (err) {
+        continue;
       }
     }
 
@@ -131,16 +349,34 @@ async function compileEA(eaPath) {
   return new Promise(async (resolve, reject) => {
     try {
       const metaEditorPath = await findMetaEditor();
+      const psQuote = (value) => `'${String(value).replace(/'/g, "''")}'`;
+      const compileDir = path.join(__dirname, "compile-temp");
+      await fs.mkdir(compileDir, { recursive: true });
+      const tempEaPath = path.join(compileDir, path.basename(eaPath));
+      await fs.copyFile(eaPath, tempEaPath);
       const logFile = path.join(
-        path.dirname(eaPath),
+        compileDir,
         `${path.basename(eaPath, ".mq4")}_compile.log`
       );
 
-      // MetaEditor command line compilation
-      const compiler = spawn(metaEditorPath, [
-        `/compile:${eaPath}`,
-        `/log:${logFile}`,
-        `/inc:${path.dirname(eaPath)}\\..\\Include`,
+      const incPath = `${path.dirname(eaPath)}\\..\\Include`;
+      const psScript = [
+        `$metaEditor = ${psQuote(metaEditorPath)};`,
+        `$eaPath = ${psQuote(tempEaPath)};`,
+        `$logFile = ${psQuote(logFile)};`,
+        `$incPath = ${psQuote(incPath)};`,
+        "Remove-Item -LiteralPath $logFile -ErrorAction SilentlyContinue;",
+        "$p = Start-Process -FilePath $metaEditor -ArgumentList @('/compile:' + $eaPath, '/log:' + $logFile, '/inc:' + $incPath) -Wait -PassThru -WindowStyle Hidden;",
+        "if ($null -ne $p.ExitCode) { exit $p.ExitCode } else { exit 0 }",
+      ].join(" ");
+
+      // MetaEditor is more reliable on Windows when launched via Start-Process -Wait.
+      const compiler = spawn("powershell.exe", [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        psScript,
       ]);
 
       let stdout = "";
@@ -164,11 +400,14 @@ async function compileEA(eaPath) {
             logContent = "Compilation log not available";
           }
 
-          // Check if .ex4 file was created
+          // Check if .ex4 file was created in the temp compile folder,
+          // then copy it back into MT4 Experts.
+          const tempEx4Path = tempEaPath.replace(".mq4", ".ex4");
           const ex4Path = eaPath.replace(".mq4", ".ex4");
           let compiled = false;
           try {
-            await fs.access(ex4Path);
+            await fs.access(tempEx4Path);
+            await fs.copyFile(tempEx4Path, ex4Path);
             compiled = true;
           } catch (ex4Err) {
             // .ex4 not created, compilation likely failed
@@ -382,24 +621,129 @@ app.get("/api/history", async (req, res) => {
 // Run backtest
 app.post("/api/backtest", async (req, res) => {
   try {
-    const backtestCommand = {
-      action: "RUN_BACKTEST",
-      ...req.body,
-      timestamp: Date.now(),
-    };
+    const runId = `${Date.now()}_${sanitizeFilePart(req.body.expert)}_${sanitizeFilePart(req.body.symbol)}_${sanitizeFilePart(req.body.timeframe)}`;
+    const runDir = path.join(BACKTEST_WORK_DIR, runId);
+    await fs.mkdir(runDir, { recursive: true });
+    await fs.mkdir(REPORTS_DIR, { recursive: true });
 
-    await writeMT4File(
-      "backtest_commands.txt",
-      JSON.stringify(backtestCommand)
-    );
+    const backtestRoot = path.dirname(MT4_TERMINAL_PATH);
+    const testerDir = path.join(backtestRoot, "tester");
+    const testerReportsDir = path.join(testerDir, "reports");
+    await fs.mkdir(testerDir, { recursive: true });
+    await fs.mkdir(testerReportsDir, { recursive: true });
 
-    res.json({
-      success: true,
-      message: "Backtest command sent to MT4",
+    const reportName = `${runId}_report`;
+    const reportBase = path.join(testerReportsDir, reportName);
+    const reportFile = `${reportBase}.htm`;
+    const setFileName = `${runId}_inputs.set`;
+    const setFile = path.join(testerDir, setFileName);
+    const configFile = path.join(runDir, "tester.ini");
+    await prepareBacktestExpert(req.body.expert);
+    await writeSetFile(setFile, req.body.parameters || {});
+
+    const config = [
+      "Login=0",
+      "ProxyEnable=false",
+      "NewsEnable=false",
+      `TestExpert=${req.body.expert}`,
+      `TestExpertParameters=${setFileName}`,
+      `TestSymbol=${req.body.symbol}`,
+      `TestPeriod=${mapTesterPeriod(req.body.timeframe)}`,
+      `TestModel=${mapTesterModel(req.body.model)}`,
+      "TestSpread=0",
+      "TestOptimization=false",
+      "TestDateEnable=true",
+      `TestFromDate=${normalizeDate(req.body.from_date)}`,
+      `TestToDate=${normalizeDate(req.body.to_date)}`,
+      `TestDeposit=${Number(req.body.initial_deposit || 10000)}`,
+      "TestCurrency=USD",
+      `TestReport=tester\\reports\\${reportName}`,
+      "TestReplaceReport=true",
+      "TestShutdownTerminal=true",
+      "",
+    ].join("\r\n");
+    await fs.writeFile(configFile, config, "utf-8");
+
+    await updateBacktestStatus({
+      status: "running",
+      run_id: runId,
       expert: req.body.expert,
       symbol: req.body.symbol,
       timeframe: req.body.timeframe,
+      from_date: req.body.from_date,
+      to_date: req.body.to_date,
+      config_file: configFile,
+      report_file: reportFile,
+      message: "MT4 terminal backtest started",
     });
+
+    const execution = await runTerminalBacktest(configFile, reportFile);
+    if (!execution.success) {
+      await updateBacktestStatus({
+        status: "failed",
+        run_id: runId,
+        message: execution.error || "Backtest failed",
+        execution,
+      });
+      return res.status(500).json({
+        success: false,
+        run_id: runId,
+        error: execution.error,
+        execution,
+        config_file: configFile,
+        report_file: reportFile,
+      });
+    }
+
+    const parsed = await parseBacktestReport(reportFile);
+    const result = {
+      success: true,
+      status: "completed",
+      run_id: runId,
+      expert: req.body.expert,
+      symbol: req.body.symbol,
+      timeframe: req.body.timeframe,
+      from_date: req.body.from_date,
+      to_date: req.body.to_date,
+      initial_deposit: Number(req.body.initial_deposit || 10000),
+      model: req.body.model || "Every tick",
+      optimization: Boolean(req.body.optimization),
+      config_file: configFile,
+      report_file: reportFile,
+      execution,
+      metrics: parsed,
+      timestamp: new Date().toISOString(),
+    };
+
+    await writeJsonFile(path.join(REPORTS_DIR, "backtest_results.json"), result);
+    await writeJsonFile(path.join(REPORTS_DIR, "backtest_results_detailed.json"), {
+      ...result,
+      report_text: await readTextSmart(reportFile),
+    });
+    await fs.copyFile(reportFile, path.join(REPORTS_DIR, "backtest_report.html"));
+    await updateBacktestStatus({
+      status: "completed",
+      run_id: runId,
+      message: "Backtest completed and report parsed",
+      report_file: reportFile,
+      metrics: parsed,
+    });
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/backtest/status", async (req, res) => {
+  try {
+    const statusFile = path.join(REPORTS_DIR, "backtest_status.json");
+    try {
+      const statusData = await fs.readFile(statusFile, "utf-8");
+      return res.json(JSON.parse(statusData));
+    } catch (error) {
+      return res.json(lastBacktestStatus);
+    }
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -409,11 +753,11 @@ app.post("/api/backtest", async (req, res) => {
 app.get("/api/backtest/results", async (req, res) => {
   try {
     const detailed = req.query.detailed === "true";
-    const filename = detailed
-      ? "backtest_results_detailed.txt"
-      : "backtest_results.txt";
-
-    const resultsData = await readMT4File(filename);
+    const jsonFile = path.join(
+      REPORTS_DIR,
+      detailed ? "backtest_results_detailed.json" : "backtest_results.json"
+    );
+    const resultsData = await fs.readFile(jsonFile, "utf-8");
 
     try {
       const results = JSON.parse(resultsData);
